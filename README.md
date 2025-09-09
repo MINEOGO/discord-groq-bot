@@ -33,7 +33,7 @@ Open your terminal or command prompt and run the following commands to clone the
 ```bash
 git clone https://github.com/MINEOGO/discord-groq-bot.git
 cd discord-groq-bot
-pip install groq requests
+pip install groq requests websockets
 ```
 
 ### 2. Create and Edit the Configuration File
