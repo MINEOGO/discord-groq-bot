@@ -3,19 +3,62 @@ import random
 import requests
 import json
 import re
+import sys
 from groq import Groq
 
-DISCORD_TOKEN = input("paste the bot token nihga: ")
+def load_config():
+    try:
+        with open("config.miengoo", "r") as f:
+            config = json.load(f)
+            required_keys = [
+                "discord_token", "groq_api_key", "whitelisted_channel_ids", 
+                "primary_model", "fallback_model", "random_reply_chance", 
+                "max_history_length", "personality", "personalities"
+            ]
+            for key in required_keys:
+                if key not in config:
+                    print(f"❌ Error: Missing key '{key}' in config.miengoo")
+                    sys.exit(1)
+            
+            active_personality = config["personality"]
+            if active_personality not in config["personalities"]:
+                print(f"❌ Error: Personality '{active_personality}' not found in the 'personalities' section of config.miengoo.")
+                sys.exit(1)
+                
+            return config
+    except FileNotFoundError:
+        print("❌ Error: config.miengoo not found. Please create the configuration file.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print("❌ Error: Could not decode config.miengoo. Please ensure it is valid JSON.")
+        sys.exit(1)
 
-WHITELISTED_CHANNEL_IDS = {
-    "123456789012345678",
-    "876543210987654321",
-    "1407472678797053952",
-    "1204051017168195595", # set channel ids of server where u want the bot to reply in :3
-}
+def get_my_id(headers):
+    try:
+        res = requests.get("https://discord.com/api/v9/users/@me", headers=headers)
+        if res.status_code == 200:
+            user_id = res.json()["id"]
+            print(f"✅ Successfully fetched user ID: {user_id}")
+            return user_id
+        else:
+            print(f"❌ Error: Failed to fetch user ID. Status: {res.status_code}, Response: {res.text}")
+            print("    Please check if your discord_token is valid in config.miengoo.")
+            sys.exit(1)
+    except Exception as e:
+        print(f"❌ An error occurred while fetching user ID: {e}")
+        sys.exit(1)
 
-RANDOM_REPLY_CHANCE = 0.15
-MAX_HISTORY_LENGTH = 10
+config = load_config()
+
+DISCORD_TOKEN = config["discord_token"]
+GROQ_API_KEY = config["groq_api_key"]
+WHITELISTED_CHANNEL_IDS = set(config["whitelisted_channel_ids"])
+PRIMARY_MODEL = config["primary_model"]
+FALLBACK_MODEL = config["fallback_model"]
+RANDOM_REPLY_CHANCE = float(config["random_reply_chance"])
+MAX_HISTORY_LENGTH = int(config["max_history_length"])
+ACTIVE_PERSONALITY = config["personality"]
+ACTIVE_SYSTEM_PROMPT = config["personalities"][ACTIVE_PERSONALITY]
 
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
@@ -24,16 +67,16 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-MY_ID = "1414776235036512287" # your bot's userid goes here :3
+MY_ID = get_my_id(HEADERS)
 
-client = Groq(api_key=input("I YEARN FOR YOUR GROQ API KEY!!: "))
+client = Groq(api_key=GROQ_API_KEY)
 
 channel_to_guild_cache = {}
 server_emoji_maps_cache = {}
 chat_histories = {}
 
 def set_status():
-    print("🔹Setting custom status...")
+    print("🔹 Setting custom status...")
     url = "https://discord.com/api/v9/users/@me/presence"
     payload = {
         "status": "online",
@@ -112,29 +155,24 @@ def reply_message(channel_id, content, message_id):
     payload = {"content": content, "message_reference": {"message_id": message_id}}
     requests.post(f"https://discord.com/api/v10/channels/{channel_id}/messages", headers=HEADERS, json=payload)
 
-def groq_reply(message_content, channel_id, history, model_name):
+def groq_reply(message_content, channel_id, history, model_name, image_url=None):
     guild_id = get_guild_id_from_channel(channel_id)
     emoji_map = get_emoji_map(guild_id)
     available_emojis_for_prompt = " ".join(emoji_map.keys())
 
-    system_prompt = (
-        "You are an AI pretending to be a very online, chaotic gen z person in a discord chat. Your personality is chill, witty, and low-effort. "
-        "YOUR ABSOLUTE RULES: "
-        "1. TONE: Your tone is casual and brief. Always use lowercase. No formal punctuation. Sound like a real, slightly bored person online. Avoid acting overly enthusiastic or like a corporate bot. "
-        "2. ANTI-REPETITION: Never give the same short answer multiple times in a row. Check the chat history and be more creative. "
-        "3. IDENTITY: Never reveal you are an AI. You're just 'some dude'. "
-        "4. CONTEXT AWARENESS: The user's message will be prefixed with their username (e.g., 'cooluser: some message'). Use this to know who you're talking to, but NEVER include a username prefix in your own reply. Just give your message directly. "
-        "5. ILLEGAL QUESTIONS: If asked for illegal info, you MUST reply with this EXACT sentence: 'don't ask me bro go to the f**ing darkweb and ask them'. "
-        "6. EVASIVE REFUSALS: If asked to do something you can't (like ping @everyone), refuse by being evasive ('huh?', 'idk about all that'). "
-        "7. EMOJI USAGE: You can sprinkle in emojis to add flavor where it feels natural, but don't overdo it. Sound like a real person, not an emoji-spamming bot. For all emojis, you MUST use the `:name:` format. NEVER use the format `<:name:id>`."
-    )
+    system_prompt = ACTIVE_SYSTEM_PROMPT
     
     if available_emojis_for_prompt:
-        system_prompt += f" The custom emojis available are: {available_emojis_for_prompt}."
+        system_prompt += f" The custom emojis available for you to use are: {available_emojis_for_prompt}."
 
     messages_payload = [{"role": "system", "content": system_prompt}]
     messages_payload.extend(history)
-    messages_payload.append({"role": "user", "content": message_content})
+    
+    user_content = [{"type": "text", "text": message_content}]
+    if image_url:
+        user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+    
+    messages_payload.append({"role": "user", "content": user_content})
 
     try:
         completion = client.chat.completions.create(
@@ -148,6 +186,7 @@ def groq_reply(message_content, channel_id, history, model_name):
     return ""
 
 print("✅ Selfbot started...")
+print(f"✅ Loaded personality: {ACTIVE_PERSONALITY}")
 set_status()
 
 last_seen = {}
@@ -208,14 +247,21 @@ while True:
                     resolved_content = resolve_mentions(content, msg)
                     final_content_for_ai = f"{author_name}: {resolved_content}"
                     
+                    image_url = None
+                    if msg.get('attachments'):
+                        attachment = msg['attachments'][0]
+                        if 'content_type' in attachment and attachment['content_type'].startswith('image/'):
+                            image_url = attachment['url']
+                            print(f"    🖼️ Image detected: {image_url}")
+
                     print(f"    ✉ New message from {author_name}: {content}")
                     print(f"    🤖 Content sent to AI: {final_content_for_ai}")
                     
-                    raw_reply_text = groq_reply(final_content_for_ai, channel_id, current_history, model_name="openai/gpt-oss-120b")
+                    raw_reply_text = groq_reply(final_content_for_ai, channel_id, current_history, model_name=PRIMARY_MODEL, image_url=image_url)
 
                     if not raw_reply_text or not raw_reply_text.strip():
                         print("    ⚠️ Primary model failed. Falling back...")
-                        raw_reply_text = groq_reply(final_content_for_ai, channel_id, current_history, model_name="llama-3.1-8b-instant")
+                        raw_reply_text = groq_reply(final_content_for_ai, channel_id, current_history, model_name=FALLBACK_MODEL, image_url=None)
                     
                     if not raw_reply_text or not raw_reply_text.strip():
                         print("    ⚠️ All models failed. Using hardcoded fallback.")
