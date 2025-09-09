@@ -24,7 +24,7 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-MY_ID = "1414776235036512287"
+MY_ID = "1414776235036512287" # your bot's userid goes here :3
 
 client = Groq(api_key=input("I YEARN FOR YOUR GROQ API KEY!!: ")
 
