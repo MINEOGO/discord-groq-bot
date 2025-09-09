@@ -4,6 +4,9 @@ import requests
 import json
 import re
 import sys
+import threading
+import asyncio
+import websockets
 from groq import Groq
 
 def load_config():
@@ -11,20 +14,20 @@ def load_config():
         with open("config.miengoo", "r") as f:
             config = json.load(f)
             required_keys = [
-                "discord_token", "groq_api_key", "whitelisted_channel_ids", 
-                "primary_model", "fallback_model", "random_reply_chance", 
+                "discord_token", "groq_api_key", "whitelisted_channel_ids",
+                "primary_model", "fallback_model", "random_reply_chance",
                 "max_history_length", "personality", "personalities"
             ]
             for key in required_keys:
                 if key not in config:
                     print(f"❌ Error: Missing key '{key}' in config.miengoo")
                     sys.exit(1)
-            
+
             active_personality = config["personality"]
             if active_personality not in config["personalities"]:
                 print(f"❌ Error: Personality '{active_personality}' not found in the 'personalities' section of config.miengoo.")
                 sys.exit(1)
-                
+
             return config
     except FileNotFoundError:
         print("❌ Error: config.miengoo not found. Please create the configuration file.")
@@ -63,7 +66,7 @@ ACTIVE_SYSTEM_PROMPT = config["personalities"][ACTIVE_PERSONALITY]
 HEADERS = {
     "Authorization": DISCORD_TOKEN,
     "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/536.36",
     "Accept": "application/json"
 }
 
@@ -75,23 +78,78 @@ channel_to_guild_cache = {}
 server_emoji_maps_cache = {}
 chat_histories = {}
 
-def set_status():
-    print("🔹 Setting custom status...")
-    url = "https://discord.com/api/v9/users/@me/presence"
-    payload = {
-        "status": "online",
-        "activities": [{"type": 4, "name": "Custom Status", "state": "chat with me neow!!", "emoji": {"name": "💬"}}]
-    }
-    try:
-        res = requests.patch(url, headers=HEADERS, json=payload)
-        if res.status_code == 200: print("    ✅ Status updated successfully.")
-        else: print(f"    ⚠️ Failed to set status: {res.status_code} - {res.text}")
-    except Exception as e: print(f"    ❌ An error occurred while setting status: {e}")
+def gateway_worker():
+    async def gateway_main():
+        gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json"
+        while True:
+            try:
+                async with websockets.connect(gateway_url) as ws:
+                    hello = json.loads(await ws.recv())
+                    heartbeat_interval = hello['d']['heartbeat_interval'] / 1000
+
+                    asyncio.create_task(heartbeat(ws, heartbeat_interval))
+
+                    identify_payload = {
+                        "op": 2,
+                        "d": {
+                            "token": DISCORD_TOKEN,
+                            "properties": {
+                                "os": "Windows",
+                                "browser": "Chrome",
+                                "device": ""
+                            }
+                        }
+                    }
+                    await ws.send(json.dumps(identify_payload))
+
+                    async for message in ws:
+                        event = json.loads(message)
+                        if event['t'] == "READY":
+                            print("    ✅ Gateway connection is READY. Setting custom presence.")
+                            presence_payload = {
+                                "op": 3,
+                                "d": {
+                                    "since": None,
+                                    "activities": [
+                                        {
+                                            "name": "Custom Status",
+                                            "type": 4,
+                                            "state": "go sub to mineogo!!",
+                                            "emoji": {
+                                                "id": "1378218418884575313",
+                                                "name": "mineogo"
+                                            }
+                                        }
+                                    ],
+                                    "status": "online",
+                                    "afk": False
+                                }
+                            }
+                            await ws.send(json.dumps(presence_payload))
+                            break
+
+                    async for message in ws:
+                        pass
+
+            except Exception as e:
+                print(f"    ⚠️ Gateway connection error: {e}. Reconnecting in 10 seconds...")
+                await asyncio.sleep(10)
+
+    async def heartbeat(ws, interval):
+        while True:
+            await asyncio.sleep(interval)
+            heartbeat_payload = {"op": 1, "d": None}
+            try:
+                await ws.send(json.dumps(heartbeat_payload))
+            except websockets.exceptions.ConnectionClosed:
+                break
+
+    asyncio.run(gateway_main())
 
 def get_emoji_map(guild_id):
     if not guild_id: return {}
     if guild_id in server_emoji_maps_cache: return server_emoji_maps_cache[guild_id]
-    
+
     print(f"    - Fetching emoji map for server {guild_id}...")
     res = requests.get(f"https://discord.com/api/v10/guilds/{guild_id}/emojis", headers=HEADERS)
     if res.status_code == 200:
@@ -103,7 +161,7 @@ def get_emoji_map(guild_id):
 def convert_emoji_placeholders(text, channel_id):
     guild_id = get_guild_id_from_channel(channel_id)
     if not guild_id: return text
-    
+
     emoji_map = get_emoji_map(guild_id)
     if not emoji_map: return text
 
@@ -161,17 +219,17 @@ def groq_reply(message_content, channel_id, history, model_name, image_url=None)
     available_emojis_for_prompt = " ".join(emoji_map.keys())
 
     system_prompt = ACTIVE_SYSTEM_PROMPT
-    
+
     if available_emojis_for_prompt:
         system_prompt += f" The custom emojis available for you to use are: {available_emojis_for_prompt}."
 
     messages_payload = [{"role": "system", "content": system_prompt}]
     messages_payload.extend(history)
-    
+
     user_content = [{"type": "text", "text": message_content}]
     if image_url:
         user_content.append({"type": "image_url", "image_url": {"url": image_url}})
-    
+
     messages_payload.append({"role": "user", "content": user_content})
 
     try:
@@ -187,7 +245,10 @@ def groq_reply(message_content, channel_id, history, model_name, image_url=None)
 
 print("✅ Selfbot started...")
 print(f"✅ Loaded personality: {ACTIVE_PERSONALITY}")
-set_status()
+
+gateway_thread = threading.Thread(target=gateway_worker, daemon=True)
+gateway_thread.start()
+print("🔹 Gateway connection initiated to maintain custom presence...")
 
 last_seen = {}
 known_dm_channels = set()
@@ -223,10 +284,10 @@ while True:
 
             for msg in reversed(messages):
                 if msg["author"]["id"] == MY_ID: continue
-                
+
                 content = msg.get("content", "").strip()
                 if not content and not msg.get('attachments'): continue
-                
+
                 content_lower = content.lower()
                 author_name = msg["author"].get("username", "Unknown")
 
@@ -243,10 +304,10 @@ while True:
 
                 if should_reply:
                     current_history = chat_histories.get(channel_id, [])
-                    
+
                     resolved_content = resolve_mentions(content, msg)
                     final_content_for_ai = f"{author_name}: {resolved_content}"
-                    
+
                     image_url = None
                     if msg.get('attachments'):
                         attachment = msg['attachments'][0]
@@ -256,13 +317,13 @@ while True:
 
                     print(f"    ✉ New message from {author_name}: {content}")
                     print(f"    🤖 Content sent to AI: {final_content_for_ai}")
-                    
+
                     raw_reply_text = groq_reply(final_content_for_ai, channel_id, current_history, model_name=PRIMARY_MODEL, image_url=image_url)
 
                     if not raw_reply_text or not raw_reply_text.strip():
                         print("    ⚠️ Primary model failed. Falling back...")
                         raw_reply_text = groq_reply(final_content_for_ai, channel_id, current_history, model_name=FALLBACK_MODEL, image_url=None)
-                    
+
                     if not raw_reply_text or not raw_reply_text.strip():
                         print("    ⚠️ All models failed. Using hardcoded fallback.")
                         fallback_replies = ["nah", "wht", "huh?", "idk", "...", "bruh", "lol what", "anyways"]
@@ -279,9 +340,10 @@ while True:
                         current_history = current_history[-MAX_HISTORY_LENGTH:]
                     chat_histories[channel_id] = current_history
 
-            last_seen[channel_id] = messages[0]["id"]
+            if messages:
+                last_seen[channel_id] = messages[0]["id"]
 
         time.sleep(5)
     except Exception as e:
-        print(f"⚠ Error: {e}")
+        print(f"⚠ Error in main loop: {e}")
         time.sleep(10)
